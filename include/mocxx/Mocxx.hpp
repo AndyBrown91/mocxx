@@ -283,6 +283,16 @@ uintptr_t GetVtable(const T& obj) {
   return *reinterpret_cast<const uintptr_t*>(&obj);
 }
 
+struct ReplacementData {
+  ReplacementData(const void* target, std::atomic_bool& ignoring)
+    : target (target), ignoring (ignoring)
+  {
+  }
+
+  const void* target;
+  std::atomic_bool& ignoring;
+};
+
 // Required for type erasure
 struct ReplacementProxyBase
 {
@@ -293,6 +303,8 @@ struct ReplacementProxyBase
     default;
   ReplacementProxyBase& operator=(ReplacementProxyBase&&) noexcept = default;
   virtual ~ReplacementProxyBase() = default;
+
+  virtual void* GetData() = 0;
 };
 
 // Replacement proxy is parameterized by replacement signature. Its ::Invoke
@@ -311,9 +323,9 @@ public:
   ReplacementProxy& operator=(const ReplacementProxy&) = delete;
   ReplacementProxy& operator=(ReplacementProxy&&) noexcept = default;
 
-  ReplacementProxy(const void* target,
+  ReplacementProxy(const void* target, std::atomic_bool& ignoring,
                    std::function<ResultType(Args...)> replacement)
-    : mTarget(target)
+    : mData(target, ignoring)
   {
     ReplacementProxy<ResultType, Args...>::Replacements.emplace(
       target, std::move(replacement));
@@ -321,7 +333,7 @@ public:
 
   ~ReplacementProxy() override
   {
-    ReplacementProxy<ResultType, Args...>::Replacements.erase(mTarget);
+    ReplacementProxy<ResultType, Args...>::Replacements.erase(mData.target);
   }
 
   /// The actual function that substitutes a target. It dispatches correct
@@ -329,17 +341,25 @@ public:
   static ResultType Invoke(Args... args)
   {
     auto* context = gum_interceptor_get_current_invocation();
-    const auto* target =
-      gum_invocation_context_get_replacement_data(context);
-    return Replacements.at(target)(std::forward<Args>(args)...);
+    const auto* targetData =
+      static_cast<details::ReplacementData*> (gum_invocation_context_get_replacement_data(context));
+
+      if (targetData->ignoring) {
+        typedef ResultType (*fptr)(Args...);
+        return (*reinterpret_cast<const fptr>(const_cast<void*>(targetData->target)))(std::forward<Args>(args)...);
+      }
+
+    return Replacements.at(targetData->target)(std::forward<Args>(args)...);
   }
+
+  void* GetData() override { return static_cast<void*> (&mData); }
 
 private:
   inline static std::unordered_map<const void*,
                                    std::function<ResultType(Args...)>>
     Replacements;
 
-  const void* mTarget;
+  details::ReplacementData mData;
 };
 
 // Since this lambda survives beyond many API invocations here, we need to
@@ -383,24 +403,20 @@ class Mocxx
 public:
   struct ScopedIgnore
   {
-    ScopedIgnore(GumInterceptor* interceptor)
+    ScopedIgnore(Mocxx& moc)
     {
-      mInterceptor = interceptor;
-      gum_interceptor_ignore_current_thread(mInterceptor);
-      gum_interceptor_ignore_other_threads(mInterceptor);
-    }
-
-    ScopedIgnore(Mocxx& moc) : ScopedIgnore (moc.mInterceptor)
-    {
+        mInterceptor = moc.mInterceptor;
+        mIgnoring = &moc.ignoring;
+        *mIgnoring = true;
     }
 
     ~ScopedIgnore()
     {
-      gum_interceptor_unignore_current_thread(mInterceptor);
-      gum_interceptor_unignore_other_threads(mInterceptor);
+      *mIgnoring = false;
     }
 
-    GumInterceptor* mInterceptor;
+    GumInterceptor* mInterceptor = nullptr;
+    std::atomic_bool* mIgnoring = nullptr;
   };
 
   Mocxx()
@@ -417,8 +433,6 @@ public:
   Mocxx(const Mocxx&) = delete;
 
   Mocxx& operator=(const Mocxx&) = delete;
-
-  Mocxx(Mocxx&& other) noexcept = default;
 
   Mocxx& operator=(Mocxx&& other) noexcept
   {
@@ -515,11 +529,12 @@ public:
     void* targetPtr = details::TargetToVoidPtr(target);
 
     using ProxyType = decltype(details::ReplacementProxy(
-      targetPtr, TargetFunctionType(std::forward<Replacement>(replacement))));
+      targetPtr, ignoring, TargetFunctionType(std::forward<Replacement>(replacement))));
 
     mReplacements.insert_or_assign(
       targetPtr,
       std::make_unique<ProxyType>(targetPtr,
+                                  ignoring,
                                   std::forward<Replacement>(replacement)));
 
     gum_interceptor_begin_transaction(mInterceptor);
@@ -528,7 +543,7 @@ public:
       /*      target */ targetPtr,
       /* replacement */
       details::TargetToVoidPtr(&ProxyType::Invoke),
-      /*        data */ targetPtr);
+      /*        data */ mReplacements.at(targetPtr)->GetData());
     gum_interceptor_end_transaction(mInterceptor);
 
     return true;
@@ -613,11 +628,12 @@ public:
       using TargetFunctionType =
         details::ToStdFn<details::InvocableToTypeList<decltype(target)>>;
       using ProxyType = decltype(details::ReplacementProxy(
-        addr, TargetFunctionType(std::forward<Replacement>(replacement))));
+        addr, ignoring, TargetFunctionType(std::forward<Replacement>(replacement))));
 
       mReplacements.insert_or_assign(
         addr,
         std::make_unique<ProxyType>(addr,
+                                    ignoring,
                                     std::forward<Replacement>(replacement)));
 
       gum_interceptor_begin_transaction(mInterceptor);
@@ -626,7 +642,7 @@ public:
         /*      target */ addr,
         /* replacement */
         details::TargetToVoidPtr(&ProxyType::Invoke),
-        /*        data */ addr);
+        /*        data */ mReplacements.at(addr)->GetData());
       gum_interceptor_end_transaction(mInterceptor);
 
       delete obj;
@@ -643,14 +659,14 @@ public:
   template<typename TargetResult, typename TargetType, typename... TargetArgs, typename... FunctionArgs>
   TargetResult IgnoreMember(TargetResult (TargetType::*target)(TargetArgs...), TargetType* self, FunctionArgs... args)
   {
-    const ScopedIgnore ignore(mInterceptor);
+    const ScopedIgnore ignore(*this);
     return (self->*target)(std::forward<FunctionArgs...>(args...));
   }
 
   template<typename TargetResult, typename... TargetArgs, typename... FunctionArgs>
   TargetResult Ignore(TargetResult (*target)(TargetArgs...), FunctionArgs... args)
   {
-    const ScopedIgnore ignore(mInterceptor);
+    const ScopedIgnore ignore(*this);
     return (*target)(std::forward<FunctionArgs...>(args...));
   }
 
@@ -883,6 +899,8 @@ public:
   GumInterceptor* mInterceptor = nullptr;
   std::unordered_map<void*, std::unique_ptr<details::ReplacementProxyBase>>
     mReplacements;
+
+  std::atomic_bool ignoring;
 };
 
 } // namespace mocxx
