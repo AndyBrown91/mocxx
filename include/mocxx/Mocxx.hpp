@@ -233,17 +233,14 @@ TargetToVoidPtr(TargetType target)
       // address, for example virtual member function pointer is often
       // represented as and offset in vtable.  But since most compilers are
       // sane, non-virtual member function pointers are regular pointers.
-      union
+      union Splitter
       {
         TargetType pf;
         void* p;
       };
 
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
-      pf = target;
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
-      return p;
-
+      Splitter a { .pf = target };
+      return a.p;
     } else {
       // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
       return reinterpret_cast<void*>(target);
