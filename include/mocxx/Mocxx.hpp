@@ -251,6 +251,38 @@ TargetToVoidPtr(TargetType target)
   }
 }
 
+template<typename T>
+struct ExtractClassType;
+
+template<typename ResultType, typename ClassType, typename... Args>
+struct ExtractClassType<ResultType (ClassType::*)(Args...)> {
+  using type = ClassType;
+};
+
+template<typename ResultType, typename ClassType, typename... Args>
+struct ExtractClassType<ResultType (ClassType::*)(Args...) const> {
+  using type = ClassType;
+};
+
+template<typename Func>
+ptrdiff_t GetAdjustment(Func f) {
+  union {
+    Func fcn;
+    struct {
+      uintptr_t ptr;
+      ptrdiff_t adj;
+    };
+  };
+
+  fcn = f;
+  return adj;
+}
+
+template<class T>
+uintptr_t GetVtable(const T& obj) {
+  return *reinterpret_cast<const uintptr_t*>(&obj);
+}
+
 // Required for type erasure
 struct ReplacementProxyBase
 {
@@ -547,6 +579,60 @@ public:
     return Replace<true>(std::forward<Replacement>(replacement), target);
   }
 
+  /// This is the same as replace but specifically for handling the case where
+  /// the member function is virtual. It is full of UB so should be used as sparingly
+  /// as possible
+  ///
+  /// It works by creating an object of your class type, finding its VTable and then
+  /// looking up the required function using the offset in that VTable (passed in as target)
+  ///
+  /// It is reliant on the VTable being at the beginning of the object
+  ///
+  /// \param target Function to replace.
+  /// \param replacement A function like object to replace \p target.
+  ///
+  /// \returns \a true if replacement was successful, \a false otherwise.
+  template<typename Replacement, typename... CreationsArgs>
+  bool ReplaceMemberVirtual(Replacement&& replacement,
+                            details::LambdaToMemberFunction<Replacement> target,
+                            CreationsArgs... args)
+  {
+      void* addr = details::TargetToVoidPtr(target);
+
+      using CreationType = details::ExtractClassType<decltype(target)>::type;
+      auto* obj = new CreationType(args...);
+      auto vtable = details::GetVtable(*obj);
+
+      if (vtable > 0) {
+        const uintptr_t voff = reinterpret_cast<uintptr_t>(addr) > 0 ? reinterpret_cast<uintptr_t>(addr) - 1 + details::GetAdjustment(target)
+                                                                     : 0;
+        addr = *reinterpret_cast<void**>(vtable + voff);
+      }
+
+      // Split target type and pointer
+      using TargetFunctionType =
+        details::ToStdFn<details::InvocableToTypeList<decltype(target)>>;
+      using ProxyType = decltype(details::ReplacementProxy(
+        addr, TargetFunctionType(std::forward<Replacement>(replacement))));
+
+      mReplacements.insert_or_assign(
+        addr,
+        std::make_unique<ProxyType>(addr,
+                                    std::forward<Replacement>(replacement)));
+
+      gum_interceptor_begin_transaction(mInterceptor);
+      gum_interceptor_replace(
+        /*        self */ mInterceptor,
+        /*      target */ addr,
+        /* replacement */
+        details::TargetToVoidPtr(&ProxyType::Invoke),
+        /*        data */ addr);
+      gum_interceptor_end_transaction(mInterceptor);
+
+      delete obj;
+
+      return true;
+  }
   /// Call a \p target member definition ignoring any replacements.
   ///
   /// \param target Function to call.
