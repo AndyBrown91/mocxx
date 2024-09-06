@@ -349,6 +349,28 @@ Capture(Value&& value)
 class Mocxx
 {
 public:
+  struct ScopedIgnore
+  {
+    ScopedIgnore(GumInterceptor* interceptor)
+    {
+      mInterceptor = interceptor;
+      gum_interceptor_ignore_current_thread(mInterceptor);
+      gum_interceptor_ignore_other_threads(mInterceptor);
+    }
+
+    ScopedIgnore(Mocxx& moc) : ScopedIgnore (moc.mInterceptor)
+    {
+    }
+
+    ~ScopedIgnore()
+    {
+      gum_interceptor_unignore_current_thread(mInterceptor);
+      gum_interceptor_unignore_other_threads(mInterceptor);
+    }
+
+    GumInterceptor* mInterceptor;
+  };
+
   Mocxx()
   {
     // Gum must be initialized once per application because invoking
@@ -523,6 +545,27 @@ public:
                      details::LambdaToMemberFunction<Replacement> target)
   {
     return Replace<true>(std::forward<Replacement>(replacement), target);
+  }
+
+  /// Call a \p target member definition ignoring any replacements.
+  ///
+  /// \param target Function to call.
+  /// \param self The instance to call the function on.
+  /// \param args Arguments called to the function call.
+  ///
+  /// \returns \a true if replacement was successful, \a false otherwise.
+  template<typename TargetResult, typename TargetType, typename... TargetArgs, typename... FunctionArgs>
+  TargetResult IgnoreMember(TargetResult (TargetType::*target)(TargetArgs...), TargetType* self, FunctionArgs... args)
+  {
+    const ScopedIgnore ignore(mInterceptor);
+    return (self->*target)(std::forward<FunctionArgs...>(args...));
+  }
+
+  template<typename TargetResult, typename... TargetArgs, typename... FunctionArgs>
+  TargetResult Ignore(TargetResult (*target)(TargetArgs...), FunctionArgs... args)
+  {
+    const ScopedIgnore ignore(mInterceptor);
+    return (*target)(std::forward<FunctionArgs...>(args...));
   }
 
   /// Replace a \p target free function result with \p value.
