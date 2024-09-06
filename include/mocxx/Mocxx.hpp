@@ -608,7 +608,7 @@ public:
   /// \param replacement A function like object to replace \p target.
   ///
   /// \returns \a true if replacement was successful, \a false otherwise.
-  template<typename Replacement, typename... CreationsArgs>
+  template<int targetIndex, typename Replacement, typename... CreationsArgs>
   bool ReplaceMemberVirtual(Replacement&& replacement,
                             details::LambdaToMemberFunction<Replacement> target,
                             CreationsArgs... args)
@@ -619,11 +619,31 @@ public:
       auto* obj = new CreationType(args...);
       auto vtable = details::GetVtable(*obj);
 
+      void* funcAddr = nullptr;
+
+#ifdef _MSC_VER
+    /// This is a special case for Windows where I couldn't work out how to obtain the offset from the function pointer i.e target
+    /// The targetIndex that you need is the position of the function you're looking to override in the parent class
+    /// if you were to count the virtual functions that are declared
+    /// So 0 is always the virtual destructor, 1 is the first function declared virtual etc.
+    ///
+    /// The easiest way to get this index is to write your call to ReplaceMemberVirtual and set the index as 0
+    /// then put a breakpoint in this function, after addr has been given a value, in the variables view of the debugger
+    /// this will display something like: vcall'{16,{flat}}, take that number and divide by 8, thats your index
+    ///
+    /// helperValue will equal that number;
+    constexpr int helperValue = targetIndex * 8;
+
+    uintptr_t* vfptr = reinterpret_cast<uintptr_t*>(obj);
+    void** vtableArray = reinterpret_cast<void**>(*vfptr);
+    funcAddr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(vtableArray[targetIndex]));
+#else
       if (vtable > 0) {
         const uintptr_t voff = reinterpret_cast<uintptr_t>(addr) > 0 ? reinterpret_cast<uintptr_t>(addr) - 1 + details::GetAdjustment(target)
                                                                      : 0;
-        addr = *reinterpret_cast<void**>(vtable + voff);
+        funcAddr = *reinterpret_cast<void**>(vtable + voff);
       }
+#endif
 
       // Split target type and pointer
       using TargetFunctionType =
@@ -640,7 +660,7 @@ public:
       gum_interceptor_begin_transaction(mInterceptor);
       gum_interceptor_replace(
         /*        self */ mInterceptor,
-        /*      target */ addr,
+        /*      target */ funcAddr,
         /* replacement */
         details::TargetToVoidPtr(&ProxyType::Invoke),
         /*        data */ mReplacements.at(addr)->GetData());
@@ -650,6 +670,7 @@ public:
 
       return true;
   }
+
   /// Call a \p target member definition ignoring any replacements.
   ///
   /// \param target Function to call.
