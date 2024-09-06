@@ -266,16 +266,17 @@ struct ExtractClassType<ResultType (ClassType::*)(Args...) const> {
 
 template<typename Func>
 ptrdiff_t GetAdjustment(Func f) {
-  union {
-    Func fcn;
-    struct {
+  union Adjustment {
+    Func func;
+    struct Parts {
       uintptr_t ptr;
       ptrdiff_t adj;
     };
+    Parts parts;
   };
 
-  fcn = f;
-  return adj;
+  Adjustment a = { .func = f };
+  return a.parts.adj;
 }
 
 template<class T>
