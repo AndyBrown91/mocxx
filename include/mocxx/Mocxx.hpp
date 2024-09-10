@@ -639,6 +639,7 @@ public:
         const uintptr_t voff = reinterpret_cast<uintptr_t>(addr) > 0 ? reinterpret_cast<uintptr_t>(addr) - 1 + details::GetAdjustment(target)
                                                                      : 0;
         funcAddr = *reinterpret_cast<void**>(vtable + voff);
+        addr = funcAddr;
       }
 #endif
 
